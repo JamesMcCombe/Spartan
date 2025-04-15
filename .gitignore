@@ -1,0 +1,19 @@
+# Generated pipeline outputs
+pipeline_*/
+
+# Cache files
+scripts/token_cache.pkl
+
+# Python bytecode and cache
+__pycache__/
+*.pyc
+
+# Virtual environment
+.venv/
+
+# IDE files
+.vscode/
+
+# Other temporary files
+*.log
+*.tmp

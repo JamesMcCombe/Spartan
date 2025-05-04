@@ -52,7 +52,7 @@ def get_token_meta(token_address):
                 TOKEN_META_ENDPOINT, headers=HEADERS, params=params, timeout=15)  # Increased timeout
             if response.status_code == 429:
                 logging.warning(
-                    f"Rate limit hit for {token_address}, waiting 60 seconds...")
+                    f"Rate limit hit for {token_address}, waiting 10 seconds...")
                 time.sleep(10)  # Wait for 10 seconds before retrying
                 continue
             response.raise_for_status()

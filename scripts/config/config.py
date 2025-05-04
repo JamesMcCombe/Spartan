@@ -26,6 +26,7 @@ TOKEN_META_URL = f"{BASE_URL}/token/meta"
 TOKEN_DEFI_ACTIVITIES_URL = f"{BASE_URL}/token/defi/activities"
 TOKEN_TRANSFERS_URL = f"{BASE_URL}/token/transfer"
 TOKEN_MARKETS_URL = f"{BASE_URL}/token/markets"
+COINGECKO_ENDPOINT = "https://pro-api.coingecko.com/api/v3/coins/solana/market_chart/range"
 
 # DEX Program IDs
 RAYDIUM_PROGRAM_ID = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"

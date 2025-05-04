@@ -1,0 +1,377 @@
+@echo off
+setlocal EnableDelayedExpansion
+
+::======================================================================
+:: SPARTAN v9 - Incremental Analysis Pipeline Orchestrator
+:: Scan Newest -> Incremental Fetch & Analysis -> Optimize
+::======================================================================
+
+:: Set console to UTF-8
+chcp 65001 >nul
+
+:: --- Configuration ---
+
+:: 1. Define Stages (Using Days Back for Historical Fetch Windows)
+::    NOTE: Stage 1 Analysis now uses the full initial scan, but filters
+::          internally by time for profile calculation (0-3 days).
+::          Subsequent fetches get tokens from specific past windows.
+set STAGE1_ANALYSIS_DAYS=3  
+:: Analyze 0-3 days from initial scan pool
+
+:: Fetch Window 1 (Used after Stage 1 Analysis)
+set STAGE2_FETCH_DAYS_START=5
+set STAGE2_FETCH_DAYS_END=3
+:: Fetch Window 2 (Used after Stage 2 Analysis)
+set STAGE3_FETCH_DAYS_START=10
+set STAGE3_FETCH_DAYS_END=5
+:: Fetch Window 3 (Used after Stage 3 Analysis)
+set STAGE4_FETCH_DAYS_START=20
+set STAGE4_FETCH_DAYS_END=10
+:: Fetch Window 4 (Used after Stage 4 Analysis)
+set STAGE5_FETCH_DAYS_START=40
+set STAGE5_FETCH_DAYS_END=20
+
+
+:: 2. Define Filter Thresholds per Stage
+::    **TUNE THESE BASED ON YOUR FINDINGS!**
+
+:: Stage 1 Filters (Based on 0-3 Days Data) - Very Lenient
+set LOW_VOL_PCT_S1=100.0       
+:: Allow almost all volume profiles initially
+set MIN_CONSISTENCY_S1=0.0     
+:: No consistency filter yet
+set MIN_RELIABLE_GAIN_S1=0.0  
+:: No gain floor filter yet
+set RELIABLE_PERCENTILE_S1=0
+set MIN_TOKENS_S1=2            
+:: Must have at least 2 tokens in the 0-3 day window
+
+:: Stage 2 Filters (Based on 0-5 Days Data)
+set LOW_VOL_PCT_S2=99.0
+set MIN_CONSISTENCY_S2=0.0
+set MIN_RELIABLE_GAIN_S2=5.0
+:: Start filtering for at least 5% reliable gain
+set RELIABLE_PERCENTILE_S2=0
+set MIN_TOKENS_S2=3
+
+:: Stage 3 Filters (Based on 0-10 Days Data)
+set LOW_VOL_PCT_S3=98.0
+set MIN_CONSISTENCY_S3=0.0
+set MIN_RELIABLE_GAIN_S3=6.0
+set RELIABLE_PERCENTILE_S3=0
+set MIN_TOKENS_S3=4
+
+:: Stage 4 Filters (Based on 0-20 Days Data)
+set LOW_VOL_PCT_S4=97
+set MIN_CONSISTENCY_S4=0.0
+set MIN_RELIABLE_GAIN_S4=7.0
+:: Require at least 10% reliable gain
+set RELIABLE_PERCENTILE_S4=0
+set MIN_TOKENS_S4=5
+
+:: Stage 5 Filters (Based on 0-40 Days Data) - Final Strict
+set LOW_VOL_PCT_S5=96.0
+set MIN_CONSISTENCY_S5=0
+set MIN_RELIABLE_GAIN_S5=8.0
+set RELIABLE_PERCENTILE_S5=0
+set MIN_TOKENS_S5=6
+
+
+:: 3. Script Paths (Adjust if necessary)
+set SCAN_SCRIPT=.\scan_tokens.py
+set INSPECT_SCRIPT=.\inspect_repeat_creators.py
+set FETCH_HIST_SCRIPT=.\fetch_historical_tokens.py
+set ANALYZE_STAGE_SCRIPT=.\analyze_and_filter_stage.py
+set REPORT_SCRIPT=.\generate_summary_report_v9.py
+set RANK_OPTIMIZE_SCRIPT=.\rank_and_optimize_v9.py
+
+:: 4. Master DB Location
+set MASTER_DB_DIR=%ROOT_DIR%\DB
+
+
+:: --- Setup ---
+for /f "tokens=2 delims==" %%I in ('wmic os get localdatetime /value') do set "DATETIME=%%I"
+set "TIMESTAMP=%DATETIME:~0,8%_%DATETIME:~8,6%"
+set "ROOT_DIR=pipeline_v9_final_%TIMESTAMP%" 
+:: Renamed root dir slightly
+echo Creating pipeline directory: %ROOT_DIR%
+mkdir "%ROOT_DIR%"
+if not exist "%ROOT_DIR%" ( echo ERROR: Failed to create directory %ROOT_DIR%. & goto :end )
+
+:: Define stage-specific directories
+set SCAN_DIR=%ROOT_DIR%\01_scan_tokens
+set INSPECT_DIR=%ROOT_DIR%\02_inspect_creators
+set ANALYZE1_DIR=%ROOT_DIR%\03_analysis_stage1
+set FETCH2_DIR=%ROOT_DIR%\04_fetch_stage2
+set ANALYZE2_DIR=%ROOT_DIR%\05_analysis_stage2
+set FETCH3_DIR=%ROOT_DIR%\06_fetch_stage3
+set ANALYZE3_DIR=%ROOT_DIR%\07_analysis_stage3
+set FETCH4_DIR=%ROOT_DIR%\08_fetch_stage4
+set ANALYZE4_DIR=%ROOT_DIR%\09_analysis_stage4
+set FETCH5_DIR=%ROOT_DIR%\10_fetch_stage5
+set ANALYZE5_DIR=%ROOT_DIR%\11_analysis_stage5
+set OPTIMIZE_DIR=%ROOT_DIR%\12_optimization_results
+
+
+:: --- Execution ---
+
+:: ========================== STEP 1: Initial Scan (Newest ~50k) ==========================
+echo.
+echo [--- Starting Step 1: Scan Newest Tokens ---]
+mkdir "%SCAN_DIR%" > nul 2>&1
+python %SCAN_SCRIPT% --output-dir "%ROOT_DIR%" --pattern "pump"
+if %ERRORLEVEL% neq 0 ( echo ERROR in %SCAN_SCRIPT%. & goto :cleanup )
+echo %SCAN_SCRIPT% completed.
+
+:: ========================== STEP 2: Inspect Creators ==========================
+echo.
+echo [--- Starting Step 2: Inspect Creators ---]
+mkdir "%INSPECT_DIR%" > nul 2>&1
+python %INSPECT_SCRIPT% --input-dir "%ROOT_DIR%"
+if %ERRORLEVEL% neq 0 ( echo ERROR in %INSPECT_SCRIPT%. & goto :cleanup )
+echo %INSPECT_SCRIPT% completed.
+
+:: Find the latest creator_analysis JSON file from inspect step
+set "INSPECT_OUT_JSON="
+for /f "delims=" %%F in ('dir /b /o-d /a-d "%INSPECT_DIR%\creator_analysis_*.json"') do (
+    set "INSPECT_OUT_JSON=%INSPECT_DIR%\%%F"
+    goto :found_inspect_json_initial
+)
+echo ERROR: Could not find creator_analysis_*.json in %INSPECT_DIR%
+goto :cleanup
+:found_inspect_json_initial
+echo Using inspect output: !INSPECT_OUT_JSON!
+
+
+:: ========================== STAGE 1 Analysis (0-3 Days Filter) ==========================
+echo.
+echo [--- Starting Stage 1 Analysis (Processing 0-%STAGE1_ANALYSIS_DAYS% Day Tokens) ---]
+mkdir "%ANALYZE1_DIR%" > nul 2>&1
+set STAGE1_OUT_PKL=%ANALYZE1_DIR%\analysis_results_stage1.pkl
+set STAGE1_OUT_JSON=%ANALYZE1_DIR%\interesting_creators_stage1.json
+
+python %ANALYZE_STAGE_SCRIPT% ^
+    --input-tokens-json "!INSPECT_OUT_JSON!" ^
+    --input-results-pkl "" ^
+    --output-results-pkl "%STAGE1_OUT_PKL%" ^
+    --output-creators-json "%STAGE1_OUT_JSON%" ^
+    --filter-low-vol-pct %LOW_VOL_PCT_S1% ^
+    --filter-min-consistency %MIN_CONSISTENCY_S1% ^
+    --filter-min-reliable-gain %MIN_RELIABLE_GAIN_S1% ^
+    --filter-reliable-percentile %RELIABLE_PERCENTILE_S1% ^
+    --min-token-count %MIN_TOKENS_S1% ^
+    --analysis-max-days %STAGE1_ANALYSIS_DAYS%
+
+if %ERRORLEVEL% neq 0 ( echo ERROR in %ANALYZE_STAGE_SCRIPT% for Stage 1. & goto :cleanup )
+
+echo Generating Stage 1 Summary Report...
+if exist "%STAGE1_OUT_JSON%" ( python %REPORT_SCRIPT% --input-json "%STAGE1_OUT_JSON%" --output-dir "%ANALYZE1_DIR%" ) else ( echo WARNING: Stage 1 JSON missing. )
+echo [--- Stage 1 Analysis Complete ---]
+
+
+:: ========================== STAGE 2 Fetch & Analyze (0-5 Days Total) ==========================
+echo.
+echo [--- Starting Stage 2 Fetch and Analyze (%STAGE2_FETCH_DAYS_END%-%STAGE2_FETCH_DAYS_START% Days Ago -> 0-5 Days Total) ---]
+if not exist "%STAGE1_OUT_JSON%" ( echo WARNING: Stage 1 survivors JSON missing. Skipping rest of pipeline. & goto :skip_to_end )
+
+mkdir "%FETCH2_DIR%" > nul 2>&1
+set STAGE2_FETCH_OUT_JSON=%FETCH2_DIR%\creator_tokens_stage2_new.json
+echo Running %FETCH_HIST_SCRIPT% for Stage 2...
+python %FETCH_HIST_SCRIPT% --input-creators-json "%STAGE1_OUT_JSON%" --days-back-start %STAGE2_FETCH_DAYS_START% --days-back-end %STAGE2_FETCH_DAYS_END% --output-tokens-json "%STAGE2_FETCH_OUT_JSON%"
+if %ERRORLEVEL% neq 0 ( echo ERROR in %FETCH_HIST_SCRIPT% for Stage 2. & goto :cleanup )
+
+mkdir "%ANALYZE2_DIR%" > nul 2>&1
+set STAGE2_OUT_PKL=%ANALYZE2_DIR%\analysis_results_stage2.pkl
+set STAGE2_OUT_JSON=%ANALYZE2_DIR%\interesting_creators_stage2.json
+if not exist "%STAGE2_FETCH_OUT_JSON%" ( echo WARNING: Stage 2 fetched file missing. Skipping analysis. & goto :skip_stage2_analysis )
+if not exist "%STAGE1_OUT_PKL%" ( echo WARNING: Stage 1 PKL missing. Skipping analysis. & goto :skip_stage2_analysis )
+echo Running %ANALYZE_STAGE_SCRIPT% for Stage 2...
+python %ANALYZE_STAGE_SCRIPT% ^
+    --input-tokens-json "%STAGE2_FETCH_OUT_JSON%" ^
+    --input-results-pkl "%STAGE1_OUT_PKL%" ^
+    --output-results-pkl "%STAGE2_OUT_PKL%" ^
+    --output-creators-json "%STAGE2_OUT_JSON%" ^
+    --filter-low-vol-pct %LOW_VOL_PCT_S2% ^
+    --filter-min-consistency %MIN_CONSISTENCY_S2% ^
+    --filter-min-reliable-gain %MIN_RELIABLE_GAIN_S2% ^
+    --filter-reliable-percentile %RELIABLE_PERCENTILE_S2% ^
+    --min-token-count %MIN_TOKENS_S2% ^
+    --analysis-max-days %STAGE2_FETCH_DAYS_START% 
+    :: Analyze combined up to 5 days old (match fetch window)
+if %ERRORLEVEL% neq 0 ( echo ERROR in %ANALYZE_STAGE_SCRIPT% for Stage 2. & goto :cleanup )
+
+:skip_stage2_analysis
+echo Generating Stage 2 Summary Report...
+if exist "%STAGE2_OUT_JSON%" ( python %REPORT_SCRIPT% --input-json "%STAGE2_OUT_JSON%" --output-dir "%ANALYZE2_DIR%" ) else ( echo WARNING: Stage 2 JSON missing. )
+echo [--- Stage 2 Analysis Complete ---]
+
+
+:: ========================== STAGE 3 Fetch & Analyze (0-10 Days Total) ==========================
+echo.
+echo [--- Starting Stage 3 Fetch and Analyze (%STAGE3_FETCH_DAYS_END%-%STAGE3_FETCH_DAYS_START% Days Ago -> 0-10 Days Total) ---]
+if not exist "%STAGE2_OUT_JSON%" ( echo WARNING: Stage 2 survivors JSON missing. Skipping rest of pipeline. & goto :skip_to_end )
+
+mkdir "%FETCH3_DIR%" > nul 2>&1
+set STAGE3_FETCH_OUT_JSON=%FETCH3_DIR%\creator_tokens_stage3_new.json
+echo Running %FETCH_HIST_SCRIPT% for Stage 3...
+python %FETCH_HIST_SCRIPT% --input-creators-json "%STAGE2_OUT_JSON%" --days-back-start %STAGE3_FETCH_DAYS_START% --days-back-end %STAGE3_FETCH_DAYS_END% --output-tokens-json "%STAGE3_FETCH_OUT_JSON%"
+if %ERRORLEVEL% neq 0 ( echo ERROR in %FETCH_HIST_SCRIPT% for Stage 3. & goto :cleanup )
+
+mkdir "%ANALYZE3_DIR%" > nul 2>&1
+set STAGE3_OUT_PKL=%ANALYZE3_DIR%\analysis_results_stage3.pkl
+set STAGE3_OUT_JSON=%ANALYZE3_DIR%\interesting_creators_stage3.json
+if not exist "%STAGE3_FETCH_OUT_JSON%" ( echo WARNING: Stage 3 fetched file missing. Skipping analysis. & goto :skip_stage3_analysis )
+if not exist "%STAGE2_OUT_PKL%" ( echo WARNING: Stage 2 PKL missing. Skipping analysis. & goto :skip_stage3_analysis )
+echo Running %ANALYZE_STAGE_SCRIPT% for Stage 3...
+python %ANALYZE_STAGE_SCRIPT% ^
+    --input-tokens-json "%STAGE3_FETCH_OUT_JSON%" ^
+    --input-results-pkl "%STAGE2_OUT_PKL%" ^
+    --output-results-pkl "%STAGE3_OUT_PKL%" ^
+    --output-creators-json "%STAGE3_OUT_JSON%" ^
+    --filter-low-vol-pct %LOW_VOL_PCT_S3% ^
+    --filter-min-consistency %MIN_CONSISTENCY_S3% ^
+    --filter-min-reliable-gain %MIN_RELIABLE_GAIN_S3% ^
+    --filter-reliable-percentile %RELIABLE_PERCENTILE_S3% ^
+    --min-token-count %MIN_TOKENS_S3% ^
+     --analysis-max-days %STAGE3_FETCH_DAYS_START% 
+     :: Analyze combined up to 10 days old
+if %ERRORLEVEL% neq 0 ( echo ERROR in %ANALYZE_STAGE_SCRIPT% for Stage 3. & goto :cleanup )
+
+:skip_stage3_analysis
+echo Generating Stage 3 Summary Report...
+if exist "%STAGE3_OUT_JSON%" ( python %REPORT_SCRIPT% --input-json "%STAGE3_OUT_JSON%" --output-dir "%ANALYZE3_DIR%" ) else ( echo WARNING: Stage 3 JSON missing. )
+echo [--- Stage 3 Analysis Complete ---]
+
+
+:: ========================== STAGE 4 Fetch & Analyze (0-20 Days Total) ==========================
+echo.
+echo [--- Starting Stage 4 Fetch and Analyze (%STAGE4_FETCH_DAYS_END%-%STAGE4_FETCH_DAYS_START% Days Ago -> 0-20 Days Total) ---]
+if not exist "%STAGE3_OUT_JSON%" ( echo WARNING: Stage 3 survivors JSON missing. Skipping rest of pipeline. & goto :skip_to_end )
+
+mkdir "%FETCH4_DIR%" > nul 2>&1
+set STAGE4_FETCH_OUT_JSON=%FETCH4_DIR%\creator_tokens_stage4_new.json
+echo Running %FETCH_HIST_SCRIPT% for Stage 4...
+python %FETCH_HIST_SCRIPT% --input-creators-json "%STAGE3_OUT_JSON%" --days-back-start %STAGE4_FETCH_DAYS_START% --days-back-end %STAGE4_FETCH_DAYS_END% --output-tokens-json "%STAGE4_FETCH_OUT_JSON%"
+if %ERRORLEVEL% neq 0 ( echo ERROR in %FETCH_HIST_SCRIPT% for Stage 4. & goto :cleanup )
+
+mkdir "%ANALYZE4_DIR%" > nul 2>&1
+set STAGE4_OUT_PKL=%ANALYZE4_DIR%\analysis_results_stage4.pkl
+set STAGE4_OUT_JSON=%ANALYZE4_DIR%\interesting_creators_stage4.json
+if not exist "%STAGE4_FETCH_OUT_JSON%" ( echo WARNING: Stage 4 fetched file missing. Skipping analysis. & goto :skip_stage4_analysis )
+if not exist "%STAGE3_OUT_PKL%" ( echo WARNING: Stage 3 PKL missing. Skipping analysis. & goto :skip_stage4_analysis )
+echo Running %ANALYZE_STAGE_SCRIPT% for Stage 4...
+python %ANALYZE_STAGE_SCRIPT% ^
+    --input-tokens-json "%STAGE4_FETCH_OUT_JSON%" ^
+    --input-results-pkl "%STAGE3_OUT_PKL%" ^
+    --output-results-pkl "%STAGE4_OUT_PKL%" ^
+    --output-creators-json "%STAGE4_OUT_JSON%" ^
+    --filter-low-vol-pct %LOW_VOL_PCT_S4% ^
+    --filter-min-consistency %MIN_CONSISTENCY_S4% ^
+    --filter-min-reliable-gain %MIN_RELIABLE_GAIN_S4% ^
+    --filter-reliable-percentile %RELIABLE_PERCENTILE_S4% ^
+    --min-token-count %MIN_TOKENS_S4% ^
+     --analysis-max-days %STAGE4_FETCH_DAYS_START% 
+     :: Analyze combined up to 20 days old
+if %ERRORLEVEL% neq 0 ( echo ERROR in %ANALYZE_STAGE_SCRIPT% for Stage 4. & goto :cleanup )
+
+:skip_stage4_analysis
+echo Generating Stage 4 Summary Report...
+if exist "%STAGE4_OUT_JSON%" ( python %REPORT_SCRIPT% --input-json "%STAGE4_OUT_JSON%" --output-dir "%ANALYZE4_DIR%" ) else ( echo WARNING: Stage 4 JSON missing. )
+echo [--- Stage 4 Analysis Complete ---]
+
+
+:: ========================== STAGE 5 Fetch & Analyze (0-40 Days Total) ==========================
+echo.
+echo [--- Starting Stage 5 Fetch and Analyze (%STAGE5_FETCH_DAYS_END%-%STAGE5_FETCH_DAYS_START% Days Ago -> 0-40 Days Total) ---]
+if not exist "%STAGE4_OUT_JSON%" ( echo WARNING: Stage 4 survivors JSON missing. Skipping rest of pipeline. & goto :skip_to_end )
+
+mkdir "%FETCH5_DIR%" > nul 2>&1
+set STAGE5_FETCH_OUT_JSON=%FETCH5_DIR%\creator_tokens_stage5_new.json
+echo Running %FETCH_HIST_SCRIPT% for Stage 5...
+python %FETCH_HIST_SCRIPT% --input-creators-json "%STAGE4_OUT_JSON%" --days-back-start %STAGE5_FETCH_DAYS_START% --days-back-end %STAGE5_FETCH_DAYS_END% --output-tokens-json "%STAGE5_FETCH_OUT_JSON%"
+if %ERRORLEVEL% neq 0 ( echo ERROR in %FETCH_HIST_SCRIPT% for Stage 5. & goto :cleanup )
+
+mkdir "%ANALYZE5_DIR%" > nul 2>&1
+set STAGE5_OUT_PKL=%ANALYZE5_DIR%\analysis_results_stage5.pkl
+set STAGE5_OUT_JSON=%ANALYZE5_DIR%\interesting_creators_stage5.json
+if not exist "%STAGE5_FETCH_OUT_JSON%" ( echo WARNING: Stage 5 fetched file missing. Skipping analysis. & goto :skip_stage5_analysis )
+if not exist "%STAGE4_OUT_PKL%" ( echo WARNING: Stage 4 PKL missing. Skipping analysis. & goto :skip_stage5_analysis )
+echo Running %ANALYZE_STAGE_SCRIPT% for Stage 5...
+python %ANALYZE_STAGE_SCRIPT% ^
+    --input-tokens-json "%STAGE5_FETCH_OUT_JSON%" ^
+    --input-results-pkl "%STAGE4_OUT_PKL%" ^
+    --output-results-pkl "%STAGE5_OUT_PKL%" ^
+    --output-creators-json "%STAGE5_OUT_JSON%" ^
+    --filter-low-vol-pct %LOW_VOL_PCT_S5% ^
+    --filter-min-consistency %MIN_CONSISTENCY_S5% ^
+    --filter-min-reliable-gain %MIN_RELIABLE_GAIN_S5% ^
+    --filter-reliable-percentile %RELIABLE_PERCENTILE_S5% ^
+    --min-token-count %MIN_TOKENS_S5% ^
+     --analysis-max-days %STAGE5_FETCH_DAYS_START% 
+     :: Analyze combined up to 40 days old
+if %ERRORLEVEL% neq 0 ( echo ERROR in %ANALYZE_STAGE_SCRIPT% for Stage 5. & goto :cleanup )
+
+:skip_stage5_analysis
+echo Generating Stage 5 Summary Report...
+if exist "%STAGE5_OUT_JSON%" ( python %REPORT_SCRIPT% --input-json "%STAGE5_OUT_JSON%" --output-dir "%ANALYZE5_DIR%" ) else ( echo WARNING: Stage 5 JSON missing. )
+echo [--- Stage 5 Analysis Complete ---]
+
+
+:: ========================== FINAL STEP - Rank & Optimize ==========================
+echo.
+echo [--- Preparing for Rank and Optimize ---]
+:: Use the PKL file from the LAST defined stage
+set FINAL_ANALYSIS_PKL=%STAGE5_OUT_PKL%
+set OPTIMIZE_REPORT_DIR=%ROOT_DIR%\12_optimization_results 
+:: Updated dir number
+
+:: MASTER_DB_DIR defined in Configuration section
+
+if not exist "%FINAL_ANALYSIS_PKL%" (
+    echo ERROR: Final analysis PKL file not found: %FINAL_ANALYSIS_PKL%
+    echo Cannot proceed with optimization. Check logs.
+    goto :cleanup_no_opt
+)
+
+echo Running %RANK_OPTIMIZE_SCRIPT% using %FINAL_ANALYSIS_PKL% ...
+mkdir "%OPTIMIZE_REPORT_DIR%" > nul 2>&1
+mkdir "%MASTER_DB_DIR%" > nul 2>&1
+
+python %RANK_OPTIMIZE_SCRIPT% ^
+    --input-analysis-pkl "%FINAL_ANALYSIS_PKL%" ^
+    --output-dir "%OPTIMIZE_REPORT_DIR%" ^
+    --output-db-dir "%MASTER_DB_DIR%"
+
+if %ERRORLEVEL% neq 0 ( echo ERROR in %RANK_OPTIMIZE_SCRIPT%. & goto :cleanup )
+
+echo [--- Rank and Optimize Complete ---]
+
+
+:: ========================== (Optional Future Steps) ==========================
+:: echo Next: Run FINAL_BOSS.py using the updated database in %MASTER_DB_DIR%
+:: echo Next: Run verify_token_completeness.py ...
+
+:: ========================== END ==========================
+:skip_to_end
+echo.
+echo #### SPARTAN v9 Incremental Pipeline completed (some stages may have been skipped). ####
+echo Check logs and output directories for details.
+echo Final interesting creators list (after last filter): %STAGE5_OUT_JSON%
+echo Optimization report: %OPTIMIZE_REPORT_DIR%\optimization_backtest_report_v9.md
+echo Master DB updated in: %MASTER_DB_DIR%
+echo Full results are in %ROOT_DIR%
+goto :end
+
+:cleanup_no_opt
+echo WARNING: Optimization step skipped as final analysis file was missing.
+goto :end
+
+:: --- Error Handling ---
+:cleanup
+echo.
+echo #### Pipeline failed during execution. ####
+echo Check errors above.
+
+:end
+echo.
+pause
